@@ -1,0 +1,65 @@
+# ==========================================
+#  Student Engagement Recognition - .gitignore
+# ==========================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ---------- Virtual Environments ----------
+venv/
+env/
+.venv/
+.env/
+
+# ---------- IDE / Editor ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Data (too large for git) ----------
+data/raw/videos/
+data/processed/
+*.avi
+*.mp4
+*.MP4
+*.webm
+*.wmv
+*.mov
+
+# ---------- Model Weights (large .pth files) ----------
+# Keep model in git for judges (only ~45MB for ResNet18)
+# If too large, uncomment below:
+# models/visual/best_visual_model.pth
+
+# ---------- Excel / Data Files ----------
+data/raw/labels_train.xlsx
+
+# ---------- Results (generated files) ----------
+results_*.csv
+
+# ---------- Jupyter Notebooks Checkpoints ----------
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# ---------- PyTorch / ML ----------
+*.pt
+runs/
+wandb/
+logs/
+
+# ---------- OS Files ----------
+*.log
+*.tmp
+*.bak
