@@ -11,8 +11,8 @@
    - Attention mask guides motion branch to focus on skin regions
    - Output: per-frame BVP (blood volume pulse) signal
  
- This implementation uses pretrained UBFC-rPPG weights if available,
- otherwise falls back to unsupervised signal extraction.
+ This implementation uses weights trained via self-supervised
+ learning (POS as teacher) — see train.py.
  
  Usage:
    from deepphys import DeepPhysExtractor
@@ -193,6 +193,9 @@ class DeepPhysExtractor:
     frames as a sophisticated motion-based rPPG method.
     """
     
+    # Default weights location (produced by train.py)
+    DEFAULT_WEIGHTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deepphys_weights.pth')
+    
     def __init__(self, weights_path=None, device=None):
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -202,20 +205,58 @@ class DeepPhysExtractor:
         self.model = DeepPhysModel().to(self.device)
         self.pretrained = False
         
-        # Try to load pretrained weights
+        # Auto-detect weights: explicit path → default location → none
+        if weights_path is None and os.path.exists(self.DEFAULT_WEIGHTS):
+            weights_path = self.DEFAULT_WEIGHTS
+        
         if weights_path and os.path.exists(weights_path):
             try:
-                state_dict = torch.load(weights_path, map_location=self.device)
+                state_dict = torch.load(weights_path, map_location=self.device,
+                                        weights_only=True)
                 self.model.load_state_dict(state_dict, strict=False)
                 self.pretrained = True
-                print(f"  [DeepPhys] Loaded pretrained weights: {weights_path}")
+                print(f"  [DeepPhys] Loaded trained weights: {weights_path}")
             except Exception as e:
                 print(f"  [DeepPhys] Warning: Could not load weights: {e}")
+        
+        if not self.pretrained:
+            print(f"  [DeepPhys] WARNING: No trained weights found!")
+            print(f"  [DeepPhys] Run: python task3_rppg/train.py --video_dir data/raw/videos/Train")
         
         self.model.eval()
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
+    
+    def _get_face_roi(self, frame):
+        """Detect face and return ROI coordinates (x1,y1,x2,y2) for caching."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
+        if len(faces) == 0:
+            return None
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        margin = int(0.2 * max(w, h))
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(frame.shape[1], x + w + margin)
+        y2 = min(frame.shape[0], y + h + margin)
+        return (x1, y1, x2, y2)
+    
+    def _crop_with_cached_roi(self, frame, roi):
+        """Crop face using cached ROI coordinates — skips Haar cascade."""
+        if roi is None:
+            return None
+        x1, y1, x2, y2 = roi
+        x1 = max(0, min(x1, frame.shape[1]-1))
+        y1 = max(0, min(y1, frame.shape[0]-1))
+        x2 = max(x1+1, min(x2, frame.shape[1]))
+        y2 = max(y1+1, min(y2, frame.shape[0]))
+        face = frame[y1:y2, x1:x2]
+        face_resized = cv2.resize(face, (DEEPPHYS_FRAME_SIZE, DEEPPHYS_FRAME_SIZE))
+        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+        face_norm = face_rgb.astype(np.float32) / 255.0
+        tensor = torch.from_numpy(face_norm).permute(2, 0, 1)
+        return tensor
     
     def _preprocess_frame(self, frame):
         """Normalize frame to [0, 1] and convert to tensor."""
@@ -227,13 +268,16 @@ class DeepPhysExtractor:
         tensor = torch.from_numpy(face_norm).permute(2, 0, 1)  # (3, 36, 36)
         return tensor
     
-    def extract_bvp(self, video_path):
+    def extract_bvp(self, video_path, stride=3):
         """
         Extract BVP signal from video using DeepPhys.
         
+        Args:
+            video_path: path to video file
+            stride: read every Nth frame (3=10fps from 30fps, enough for HR)
         Returns:
             bvp_signal: numpy array of per-frame BVP values
-            fps: frames per second
+            fps: effective frames per second (original_fps / stride)
         """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -244,78 +288,75 @@ class DeepPhysExtractor:
         if fps == 0 or fps > 60:
             fps = 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        effective_fps = fps / stride  # Adjusted fps for subsampled signal
         
         frames_tensor = []
         frame_count = 0
+        sampled_count = 0
+        cached_roi = None       # (x1, y1, x2, y2) cached face position
+        roi_detect_interval = 30  # Re-detect face every 30 sampled frames
         
-        # Read all frames and get face crops
+        # Read frames with subsampling + face ROI caching
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            tensor = self._preprocess_frame(frame)
-            if tensor is not None:
-                frames_tensor.append(tensor)
-            elif frames_tensor:
-                frames_tensor.append(frames_tensor[-1])  # repeat last
-            
             frame_count += 1
-            if frame_count % 500 == 0:
-                print(f"    [DeepPhys] Frame {frame_count}/{total_frames}")
+            
+            # Skip frames for subsampling
+            if (frame_count - 1) % stride != 0:
+                continue
+            
+            sampled_count += 1
+            
+            # Face detection: full detect every roi_detect_interval, cached otherwise
+            if cached_roi is None or sampled_count % roi_detect_interval == 1:
+                tensor = self._preprocess_frame(frame)
+                if tensor is not None:
+                    # Cache the face ROI for subsequent frames
+                    cached_roi = self._get_face_roi(frame)
+                    frames_tensor.append(tensor)
+                elif frames_tensor:
+                    frames_tensor.append(frames_tensor[-1])
+            else:
+                # Use cached ROI — skip Haar cascade
+                tensor = self._crop_with_cached_roi(frame, cached_roi)
+                if tensor is not None:
+                    frames_tensor.append(tensor)
+                elif frames_tensor:
+                    frames_tensor.append(frames_tensor[-1])
+            
+            if sampled_count % 500 == 0:
+                print(f"    [DeepPhys] Sampled {sampled_count} (frame {frame_count}/{total_frames})")
         
         cap.release()
         
-        if len(frames_tensor) < int(fps * 5):
+        if len(frames_tensor) < int(effective_fps * 5):
             print(f"  [DeepPhys] Too few frames: {len(frames_tensor)}")
-            return None, fps
+            return None, effective_fps
         
-        print(f"    [DeepPhys] Processing {len(frames_tensor)} frames through CNN...")
+        print(f"    [DeepPhys] Processing {len(frames_tensor)} sampled frames through CNN...")
         
-        # Build appearance (current frame) and motion (difference) inputs
+        # Run DeepPhys CNN (appearance + motion branches)
         bvp_signal = []
-        
         with torch.no_grad():
-            batch_size = 64
+            batch_size = 256  # Larger batch for GPU efficiency
+            app_batch, mot_batch = [], []
             
             for i in range(1, len(frames_tensor)):
-                appearance = frames_tensor[i]        # Current frame
-                motion = frames_tensor[i] - frames_tensor[i - 1]  # Difference
+                app_batch.append(frames_tensor[i])
+                mot_batch.append(frames_tensor[i] - frames_tensor[i - 1])
                 
-                # Collect batch
-                if i == 1 or len(bvp_signal) == 0:
-                    app_batch = [appearance]
-                    mot_batch = [motion]
-                else:
-                    app_batch.append(appearance)
-                    mot_batch.append(motion)
-                
-                # Process batch
                 if len(app_batch) >= batch_size or i == len(frames_tensor) - 1:
-                    app_tensor = torch.stack(app_batch).to(self.device)
-                    mot_tensor = torch.stack(mot_batch).to(self.device)
-                    
-                    if self.pretrained:
-                        out = self.model(app_tensor, mot_tensor)
-                        bvp_signal.extend(out.cpu().numpy().flatten().tolist())
-                    else:
-                        # Without pretrained weights, use motion-attention
-                        # as a sophisticated frame-difference rPPG method
-                        # Extract attention-weighted green channel difference
-                        a1 = self.model.appearance_conv1(app_tensor)
-                        attn1 = self.model.attention1(a1)
-                        
-                        # Use attention to weight the motion signal
-                        m_weighted = mot_tensor * attn1
-                        # Green channel is most informative for rPPG
-                        green_signal = m_weighted[:, 1, :, :].mean(dim=[1, 2])
-                        bvp_signal.extend(green_signal.cpu().numpy().tolist())
-                    
-                    app_batch = []
-                    mot_batch = []
+                    app_t = torch.stack(app_batch).to(self.device)
+                    mot_t = torch.stack(mot_batch).to(self.device)
+                    out = self.model(app_t, mot_t)
+                    bvp_signal.extend(out.cpu().numpy().flatten().tolist())
+                    app_batch, mot_batch = [], []
+                    del app_t, mot_t  # Free GPU memory
         
         bvp_signal = np.array(bvp_signal)
-        return bvp_signal, fps
+        return bvp_signal, effective_fps
     
     def extract_hr_from_frames(self, frames, fps):
         """
@@ -338,7 +379,7 @@ class DeepPhysExtractor:
             tensor = torch.from_numpy(rgb).permute(2, 0, 1)
             frames_tensor.append(tensor)
         
-        # Run CNN
+        # Run DeepPhys CNN (appearance + motion branches)
         bvp_signal = []
         with torch.no_grad():
             batch_size = 128
@@ -351,19 +392,9 @@ class DeepPhysExtractor:
                 if len(app_batch) >= batch_size or i == len(frames_tensor) - 1:
                     app_t = torch.stack(app_batch).to(self.device)
                     mot_t = torch.stack(mot_batch).to(self.device)
-                    
-                    if self.pretrained:
-                        out = self.model(app_t, mot_t)
-                        bvp_signal.extend(out.cpu().numpy().flatten().tolist())
-                    else:
-                        a1 = self.model.appearance_conv1(app_t)
-                        attn1 = self.model.attention1(a1)
-                        m_weighted = mot_t * attn1
-                        green_signal = m_weighted[:, 1, :, :].mean(dim=[1, 2])
-                        bvp_signal.extend(green_signal.cpu().numpy().tolist())
-                    
+                    out = self.model(app_t, mot_t)
+                    bvp_signal.extend(out.cpu().numpy().flatten().tolist())
                     app_batch, mot_batch = [], []
-        
         bvp = np.array(bvp_signal)
         
         # Bandpass + FFT (same as extract_hr)
@@ -450,7 +481,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     extractor = DeepPhysExtractor(weights_path=args.weights)
-    mode = "pretrained" if extractor.pretrained else "attention-guided"
+    mode = "trained" if extractor.pretrained else "UNTRAINED (run train.py first!)"
     print(f"  Mode: {mode} | Device: {extractor.device}")
     print(f"  Video: {args.video}")
     

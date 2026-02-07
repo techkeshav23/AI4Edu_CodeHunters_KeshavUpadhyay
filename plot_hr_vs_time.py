@@ -24,6 +24,15 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import hashlib
 
+# Import DeepPhys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'task3_rppg'))
+try:
+    from deepphys import DeepPhysExtractor
+    HAS_DEEPPHYS = True
+except ImportError:
+    HAS_DEEPPHYS = False
+    print("  WARNING: DeepPhys not available, skipping CNN-based rPPG")
+
 # ========================= CONFIG =========================
 FREQ_LOW = 0.7    # 42 BPM
 FREQ_HIGH = 3.0   # 180 BPM
@@ -158,9 +167,15 @@ def process_video(video_path):
     )
     
     rgb_signals = []
+    face_crops = []  # For DeepPhys
     frame_idx = 0
     
-    print("  Extracting face ROI RGB signals...")
+    # Haar cascade for DeepPhys face crops
+    haar_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    )
+    
+    print("  Extracting face ROI RGB signals + face crops...")
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -180,11 +195,14 @@ def process_video(video_path):
                     rgb_signals.append(rgb_signals[-1])
                 else:
                     rgb_signals.append([0, 0, 0])
+            # Collect face crop for DeepPhys
+            face_crops.append(frame.copy())
         else:
             if rgb_signals:
                 rgb_signals.append(rgb_signals[-1])
             else:
                 rgb_signals.append([0, 0, 0])
+            face_crops.append(frame.copy())
         
         frame_idx += 1
         if frame_idx % 200 == 0:
@@ -202,6 +220,31 @@ def process_video(video_path):
     pos_filtered = bandpass_filter(pos_signal, fps)
     chrom_filtered = bandpass_filter(chrom_signal, fps)
     
+    # DeepPhys BVP extraction
+    deep_signal = None
+    deep_filtered = None
+    if HAS_DEEPPHYS and len(face_crops) > int(fps * 5):
+        print("  Running DeepPhys CNN on face crops...")
+        try:
+            extractor = DeepPhysExtractor()
+            mode = "trained" if extractor.pretrained else "UNTRAINED"
+            print(f"    DeepPhys mode: {mode} | Device: {extractor.device}")
+            hr_deep, sqi_deep, bvp_deep = extractor.extract_hr_from_frames(face_crops, fps)
+            if bvp_deep is not None and len(bvp_deep) > 0:
+                deep_signal = bvp_deep
+                deep_filtered = bandpass_filter(deep_signal, fps)
+                print(f"    DeepPhys BVP: {len(deep_signal)} frames, overall HR: {hr_deep:.1f} BPM")
+            else:
+                print("    DeepPhys: insufficient signal")
+        except Exception as e:
+            print(f"    DeepPhys error: {e}")
+    elif not HAS_DEEPPHYS:
+        print("  Skipping DeepPhys (not available)")
+    
+    # Free face crops memory
+    del face_crops
+    import gc; gc.collect()
+    
     # Windowed HR estimation
     window_frames = int(WINDOW_SEC * fps)
     step_frames = int(STEP_SEC * fps)
@@ -210,6 +253,8 @@ def process_video(video_path):
     hr_values_pos = []
     hr_times_chrom = []
     hr_values_chrom = []
+    hr_times_deep = []
+    hr_values_deep = []
     
     print(f"  Computing windowed HR (window={WINDOW_SEC}s, step={STEP_SEC}s)...")
     
@@ -228,87 +273,47 @@ def process_video(video_path):
             hr_times_chrom.append(t_center)
             hr_values_chrom.append(hr_c)
     
+    # DeepPhys windowed HR (signal may be shorter due to frame diffs)
+    if deep_signal is not None and len(deep_signal) > window_frames:
+        for start in range(0, len(deep_signal) - window_frames, step_frames):
+            end = start + window_frames
+            t_center = (start + end) / 2 / fps
+            hr_d = estimate_hr_from_window(deep_signal[start:end], fps)
+            if hr_d is not None and 40 <= hr_d <= 180:
+                hr_times_deep.append(t_center)
+                hr_values_deep.append(hr_d)
+    
     # ========================= PLOT =========================
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     time_axis = np.arange(len(rgb_signals)) / fps
     
-    fig, axes = plt.subplots(4, 1, figsize=(16, 14))
+    fig, ax = plt.subplots(1, 1, figsize=(16, 6))
     
-    # --- Panel 1: Raw RGB Signals ---
-    axes[0].plot(time_axis, rgb_signals[:, 0], 'r-', alpha=0.7, linewidth=0.8, label='Red')
-    axes[0].plot(time_axis, rgb_signals[:, 1], 'g-', alpha=0.7, linewidth=0.8, label='Green')
-    axes[0].plot(time_axis, rgb_signals[:, 2], 'b-', alpha=0.7, linewidth=0.8, label='Blue')
-    axes[0].set_ylabel('Mean Pixel Value')
-    axes[0].set_title('Raw RGB Signal from Face ROI (Forehead + Cheeks)', fontweight='bold')
-    axes[0].legend(loc='upper right')
-    axes[0].set_xlim(0, time_axis[-1])
-    
-    # --- Panel 2: Filtered rPPG Signal ---
-    axes[1].plot(time_axis, pos_filtered, color='#2196F3', linewidth=0.8, alpha=0.8, label='POS (filtered)')
-    axes[1].plot(time_axis, chrom_filtered, color='#FF9800', linewidth=0.8, alpha=0.6, label='CHROM (filtered)')
-    axes[1].set_ylabel('rPPG Amplitude')
-    axes[1].set_title('Filtered rPPG Signal (Bandpass 0.7-3.0 Hz = 42-180 BPM)', fontweight='bold')
-    axes[1].legend(loc='upper right')
-    axes[1].set_xlim(0, time_axis[-1])
-    
-    # --- Panel 3: HEART RATE vs TIME (the main graph!) ---
+    # --- Heart Rate vs Time ---
     if hr_times_pos:
-        axes[2].plot(hr_times_pos, hr_values_pos, 'o-', color='#2196F3', linewidth=2, 
-                     markersize=4, alpha=0.85, label=f'POS (mean: {np.mean(hr_values_pos):.1f} BPM)')
+        ax.plot(hr_times_pos, hr_values_pos, 'o-', color='#2196F3', linewidth=2, 
+                markersize=4, alpha=0.85, label=f'POS (mean: {np.mean(hr_values_pos):.1f} BPM)')
     if hr_times_chrom:
-        axes[2].plot(hr_times_chrom, hr_values_chrom, 's-', color='#FF9800', linewidth=2, 
-                     markersize=4, alpha=0.85, label=f'CHROM (mean: {np.mean(hr_values_chrom):.1f} BPM)')
+        ax.plot(hr_times_chrom, hr_values_chrom, 's-', color='#FF9800', linewidth=2, 
+                markersize=4, alpha=0.85, label=f'CHROM (mean: {np.mean(hr_values_chrom):.1f} BPM)')
+    if hr_times_deep:
+        ax.plot(hr_times_deep, hr_values_deep, 'D-', color='#4CAF50', linewidth=2,
+                markersize=4, alpha=0.85, label=f'DeepPhys (mean: {np.mean(hr_values_deep):.1f} BPM)')
     
-    axes[2].axhspan(60, 100, alpha=0.08, color='#4CAF50', label='Normal resting HR (60-100)')
-    axes[2].axhline(y=72, color='gray', linestyle=':', alpha=0.3)
-    axes[2].set_ylabel('Heart Rate (BPM)')
-    axes[2].set_title(f'Heart Rate vs Time ({WINDOW_SEC}s window, {STEP_SEC}s step)', fontweight='bold', fontsize=14)
-    axes[2].legend(loc='upper right')
-    axes[2].set_xlim(0, time_axis[-1])
-    axes[2].set_ylim(35, 185)
+    ax.axhspan(60, 100, alpha=0.08, color='#4CAF50', label='Normal resting HR (60-100)')
+    ax.axhline(y=72, color='gray', linestyle=':', alpha=0.3)
+    ax.set_ylabel('Heart Rate (BPM)', fontsize=12)
+    ax.set_xlabel('Time (seconds)', fontsize=12)
+    ax.set_title(f'Heart Rate vs Time ({WINDOW_SEC}s window, {STEP_SEC}s step)', fontweight='bold', fontsize=14)
+    ax.legend(loc='upper right')
+    ax.set_xlim(0, time_axis[-1])
+    ax.set_ylim(35, 185)
+    ax.grid(True, alpha=0.3)
     # X-axis ticks every 5 seconds
     max_t = int(time_axis[-1]) + 1
-    axes[2].set_xticks(np.arange(0, max_t, 5))
-    axes[2].set_xticklabels([str(t) for t in range(0, max_t, 5)], fontsize=6, rotation=45)
-    
-    # --- Panel 4: Power Spectrum ---
-    freqs_p, psd_p = welch(pos_filtered, fs=fps, nperseg=min(512, len(pos_filtered)))
-    freqs_c, psd_c = welch(chrom_filtered, fs=fps, nperseg=min(512, len(chrom_filtered)))
-    bpm_p = freqs_p * 60
-    bpm_c = freqs_c * 60
-    
-    axes[3].plot(bpm_p, psd_p, color='#2196F3', linewidth=1.5, label='POS')
-    axes[3].fill_between(bpm_p, psd_p, alpha=0.2, color='#2196F3')
-    axes[3].plot(bpm_c, psd_c, color='#FF9800', linewidth=1.5, label='CHROM')
-    axes[3].fill_between(bpm_c, psd_c, alpha=0.2, color='#FF9800')
-    
-    # Mark peaks
-    valid_mask_p = (bpm_p >= 42) & (bpm_p <= 180)
-    valid_mask_c = (bpm_c >= 42) & (bpm_c <= 180)
-    if np.any(valid_mask_p) and np.any(psd_p[valid_mask_p] > 0):
-        peak_bpm_p = bpm_p[valid_mask_p][np.argmax(psd_p[valid_mask_p])]
-        axes[3].axvline(x=peak_bpm_p, color='#2196F3', linestyle='--', linewidth=1.5)
-        axes[3].annotate(f'POS: {peak_bpm_p:.1f}', xy=(peak_bpm_p, psd_p[valid_mask_p].max()), fontsize=10,
-                        color='#2196F3', fontweight='bold', xytext=(10, 5), textcoords='offset points')
-    if np.any(valid_mask_c) and np.any(psd_c[valid_mask_c] > 0):
-        peak_bpm_c = bpm_c[valid_mask_c][np.argmax(psd_c[valid_mask_c])]
-        axes[3].axvline(x=peak_bpm_c, color='#FF9800', linestyle='--', linewidth=1.5)
-        axes[3].annotate(f'CHROM: {peak_bpm_c:.1f}', xy=(peak_bpm_c, psd_c[valid_mask_c].max()), fontsize=10,
-                        color='#FF9800', fontweight='bold', xytext=(10, -15), textcoords='offset points')
-    
-    axes[3].set_xlabel('Heart Rate (BPM)')
-    axes[3].set_ylabel('Power Spectral Density')
-    axes[3].set_title('Frequency Domain — FFT Power Spectrum', fontweight='bold')
-    axes[3].set_xlim(30, 180)
-    axes[3].legend(loc='upper right')
-    
-    for ax in axes:
-        ax.grid(True, alpha=0.3)
-    
-    axes[0].set_xlabel('')
-    axes[1].set_xlabel('')
-    axes[2].set_xlabel('Time (seconds)')
+    ax.set_xticks(np.arange(0, max_t, 5))
+    ax.set_xticklabels([str(t) for t in range(0, max_t, 5)], fontsize=8, rotation=45)
     
     # Watermark: proof it's from real data
     watermark = (f"Generated: {timestamp} | Video: {video_name} | "
@@ -328,11 +333,14 @@ def process_video(video_path):
     
     # Print summary
     if hr_values_pos:
-        print(f"  POS  — Mean HR: {np.mean(hr_values_pos):.1f} BPM, "
+        print(f"  POS      — Mean HR: {np.mean(hr_values_pos):.1f} BPM, "
               f"Std: {np.std(hr_values_pos):.1f}, Range: {min(hr_values_pos):.1f}-{max(hr_values_pos):.1f}")
     if hr_values_chrom:
-        print(f"  CHROM — Mean HR: {np.mean(hr_values_chrom):.1f} BPM, "
+        print(f"  CHROM    — Mean HR: {np.mean(hr_values_chrom):.1f} BPM, "
               f"Std: {np.std(hr_values_chrom):.1f}, Range: {min(hr_values_chrom):.1f}-{max(hr_values_chrom):.1f}")
+    if hr_values_deep:
+        print(f"  DeepPhys — Mean HR: {np.mean(hr_values_deep):.1f} BPM, "
+              f"Std: {np.std(hr_values_deep):.1f}, Range: {min(hr_values_deep):.1f}-{max(hr_values_deep):.1f}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Plot HR vs Time from video')

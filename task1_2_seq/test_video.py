@@ -150,8 +150,8 @@ class EngagementLSTM(nn.Module):
         return self.head_binary(feat), self.head_regression(feat)
 
 # ========================= PREDICTION =========================
-LABEL_MAP = {0: "0.0 (Not Engaged)", 1: "0.33 (Barely Engaged)",
-             2: "0.66 (Engaged)", 3: "1.0 (Highly Engaged)"}
+LABEL_MAP = {0: "0.0 (Distracted)", 1: "0.33 (Disengaged)",
+             2: "0.66 (Nominally Engaged)", 3: "1.0 (Highly Engaged)"}
 
 def bin_prediction(val):
     if val < 0.165: return 0
@@ -225,7 +225,7 @@ def main():
     print(f"\n{'='*50}")
     print(f"  Video: {os.path.basename(args.video)}")
     print(f"{'='*50}")
-    print(f"  Task 1 (Binary):      {'Engaged' if binary_pred == 1 else 'Not Engaged'}  (prob: {binary_prob:.3f})")
+    print(f"  Task 1 (Binary):      {'1 (High Attentiveness)' if binary_pred == 1 else '0 (Low Attentiveness)'}  (prob: {binary_prob:.3f})")
     print(f"  Task 2 (Multi-class): {LABEL_MAP[multi_class]}  (raw: {reg_val:.3f})")
     print(f"{'='*50}")
 

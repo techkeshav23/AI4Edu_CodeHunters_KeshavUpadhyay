@@ -17,6 +17,7 @@ import argparse
 import numpy as np
 import cv2
 import csv
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from deepphys import DeepPhysExtractor
@@ -39,7 +40,7 @@ def main():
 
     # Init DeepPhys once
     extractor = DeepPhysExtractor(weights_path=args.weights)
-    mode = "pretrained" if extractor.pretrained else "attention-guided"
+    mode = "trained" if extractor.pretrained else "UNTRAINED (run train.py first!)"
     print(f"  Mode: {mode} | Device: {extractor.device}\n")
 
     # Find all existing .npy results
@@ -54,6 +55,7 @@ def main():
     skipped = 0
     failed = 0
     all_results = []
+    start_time = time.time()
 
     for i, npy_name in enumerate(npy_files):
         video_name = npy_name.replace('_rppg.npy', '')
@@ -85,13 +87,23 @@ def main():
             continue
 
         # Run DeepPhys only
+        vid_start = time.time()
         print(f"  [{i+1}/{len(npy_files)}] {video_name}...", end=' ', flush=True)
         try:
             hr_deep, sqi_deep, _ = extractor.extract_hr(video_path)
+            elapsed_vid = time.time() - vid_start
             data['hr_deepphys'] = hr_deep
             data['sqi_deepphys'] = sqi_deep
             np.save(npy_path, data)
-            print(f"DeepPhys: {hr_deep:.1f} BPM (SQI: {sqi_deep:.4f}) ✓")
+            
+            # ETA calculation
+            elapsed_total = time.time() - start_time
+            done = updated + 1
+            remaining = len(npy_files) - (i + 1)
+            avg_per_vid = elapsed_total / max(done, 1)
+            eta_min = (remaining * avg_per_vid) / 60
+            
+            print(f"DeepPhys: {hr_deep:.1f} BPM (SQI: {sqi_deep:.4f}) [{elapsed_vid:.0f}s] ETA: {eta_min:.0f}min ✓")
             updated += 1
         except Exception as e:
             print(f"ERROR: {e}")

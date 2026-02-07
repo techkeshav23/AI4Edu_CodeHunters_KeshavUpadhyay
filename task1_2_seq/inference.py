@@ -29,6 +29,7 @@ import argparse
 import warnings
 warnings.filterwarnings("ignore")
 
+import gc
 import cv2
 import numpy as np
 import torch
@@ -41,6 +42,7 @@ from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,
 # ========================= CONFIG =========================
 FPS_TARGET = 6
 SEQ_LEN = 100
+MAX_FRAMES = 9000  # Cap at 5 min @30fps to prevent RAM overflow
 EXTENSIONS = ['.mp4', '.MP4', '.avi', '.AVI', '.webm', '.wmv', '.mov', '.MOV']
 
 # ========================= FEATURE EXTRACTION =========================
@@ -89,16 +91,24 @@ def get_eye_ratio(landmarks, eye_indices):
     return v_dist / h_dist
 
 
+# Global FaceMesh — reuse across all videos to prevent TFLite memory leak
+_face_mesh_instance = None
+
+def _get_face_mesh():
+    global _face_mesh_instance
+    if _face_mesh_instance is None:
+        _face_mesh_instance = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5)
+    return _face_mesh_instance
+
+
 def extract_features(video_path, verbose=False):
     """Extract 9-dim features from video using MediaPipe Face Mesh."""
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    )
+    face_mesh = _get_face_mesh()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -122,10 +132,14 @@ def extract_features(video_path, verbose=False):
         if not success:
             break
 
+        if frame_count > MAX_FRAMES:
+            break  # Cap to prevent RAM overflow on long videos
+
         if frame_count % frame_interval == 0:
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             img_h, img_w, _ = image.shape
             results = face_mesh.process(image_rgb)
+            del image_rgb  # Free immediately
 
             if results.multi_face_landmarks:
                 lm = results.multi_face_landmarks[0].landmark
@@ -148,7 +162,7 @@ def extract_features(video_path, verbose=False):
         frame_count += 1
 
     cap.release()
-    face_mesh.close()
+    # Don't close face_mesh — it's reused across videos
 
     if len(features) == 0:
         return None
@@ -361,10 +375,13 @@ def main():
         if features is None or len(features) == 0:
             print(f"  [{i+1}/{len(video_names)}] FAIL - No features: {name}")
             skipped += 1
+            gc.collect()
             continue
 
         # Predict
         binary_pred, binary_prob, multi_class, reg_val = predict(features, model, device)
+        del features  # Free RAM immediately after prediction
+        gc.collect()
 
         # Select prediction based on task
         if args.task == 1:

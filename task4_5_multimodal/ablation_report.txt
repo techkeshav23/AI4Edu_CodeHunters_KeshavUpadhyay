@@ -1,0 +1,10 @@
+ABLATION REPORT: Visual-Only vs Multimodal
+==================================================
+
+Visual Only - Binary:      82.3%
+Visual Only - Multi-class:  47.5%
+Multimodal  - Binary:      87.6%
+Multimodal  - Multi-class:  53.4%
+
+Binary Improvement:      +5.3%
+Multi-class Improvement:  +5.9%
