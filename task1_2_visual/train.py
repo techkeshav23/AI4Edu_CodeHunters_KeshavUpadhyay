@@ -41,9 +41,9 @@ import cv2
 
 # ========================= CONFIG =========================
 IMG_SIZE = 224
-BATCH_SIZE = 16
-EPOCHS = 50
-LEARNING_RATE = 1e-4  # Further reduced to prevent overfitting
+BATCH_SIZE = 32  # Increased batch size for more stable gradients
+EPOCHS = 60      # More epochs since we are only training the head
+LEARNING_RATE = 1e-3 # Higher LR because we are training from scratch (Head)
 FRAMES_PER_VIDEO_TRAIN = 100
 FRAMES_PER_VIDEO_VAL = 500
 SEED = 42
@@ -56,32 +56,29 @@ class VisualEngagementModel(nn.Module):
         self.backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         in_features = self.backbone.fc.in_features
         
-        # Freeze early layers (layer1, layer2, layer3), fine-tune layer4 + fc
-        for name, param in self.backbone.named_parameters():
-            if 'layer4' not in name and 'fc' not in name:
-                param.requires_grad = False
+        # --------------------------------------------------------
+        # OPTIMIZATION: STRONG FREEZING
+        # With only ~60 videos, fine-tuning conv layers leads to massive overfitting.
+        # We freeze the ENTIRE backbone and only train the classification head.
+        # --------------------------------------------------------
+        for param in self.backbone.parameters():
+            param.requires_grad = False
         
-        hidden_dim = 256 if num_classes > 2 else 128
+        # Lightweight Head with stronger Regularization
         self.backbone.fc = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
+            nn.Linear(in_features, 256),
+            nn.BatchNorm1d(256),        # stabilize learning
             nn.ReLU(),
-            nn.Dropout(0.6),
-            nn.Linear(hidden_dim, num_classes)
+            nn.Dropout(0.6),            # high dropout
+            nn.Linear(256, num_classes)
         )
     
     def forward(self, x):
         return self.backbone(x)
     
     def get_param_groups(self):
-        backbone_params, head_params = [], []
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'fc' in name:
-                head_params.append(param)
-            else:
-                backbone_params.append(param)
-        return backbone_params, head_params
+        # All trainable parameters are in the head (fc)
+        return [], [p for p in self.parameters() if p.requires_grad]
 
 # ========================= DATASET =========================
 class EngagementDataset(Dataset):
@@ -352,12 +349,9 @@ def main():
     smoothing = 0.2 if num_classes == 4 else 0.15 # Increased smoothing
     criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=smoothing)
     
-    # Optimizer with differential LR
-    bp, hp = model.get_param_groups()
-    optimizer = optim.Adam([
-        {'params': bp, 'lr': LEARNING_RATE * 0.1},
-        {'params': hp, 'lr': LEARNING_RATE}
-    ], weight_decay=1e-3)
+    # Optimizer - simplified since backbone is frozen
+    _, hp = model.get_param_groups()
+    optimizer = optim.Adam(hp, lr=LEARNING_RATE, weight_decay=1e-2) # Stronger weight decay (0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     
     # Output path (task-specific so Task 1 and Task 2 don't overwrite each other)
